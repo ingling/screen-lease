@@ -1,0 +1,16 @@
+{
+  "stale_seconds": 120,
+  "heartbeat_seconds": 10,
+  "need_you_repeat_seconds": 0,
+  "sounds": {
+    "driving": "Tink",
+    "pausing": "Pop",
+    "paused": "Glass",
+    "need-you": "Glass",
+    "free": "Hero",
+    "stale": "Basso"
+  },
+  "on_need_you": null,
+  "on_free": null,
+  "owner_url_template": null
+}

@@ -1,0 +1,49 @@
+---
+name: screen-lease
+description: Required protocol whenever you will drive a GUI app on this Mac (activate or focus an app, take a screenshot, move the mouse, send keystrokes, or run AppleScript or JSX that needs an app in front), so you and the human never fight over the screen. Covers taking and releasing the shared screen lease, the menu bar status light, pausing, capturing a covered window, and never sending blind keystrokes. Load it before the first GUI action of a task.
+---
+
+# Sharing the screen with the human
+
+The human uses this same computer. A menu bar light (ScreenLeaseLight) shows them who has the screen:
+
+| Light | Meaning | Set by |
+|---|---|---|
+| 🔴 | an agent is driving: hands off | `acquire`, `working` |
+| 🔴⏸ | they asked for a pause; you are finishing the current step | their menu click, while a `run` step is executing |
+| 🟡 | you need them, or you paused and the screen is theirs | `need-you`, or a pause once no step is running |
+| 🟢 | the screen is theirs | `release` |
+| ⚪ | stale: you hold the lease but stopped heart-beating | no heartbeat for `stale_seconds` |
+
+Every change plays a sound, so the human can leave the app you're driving in front and still know when you're done or stuck.
+
+CLI: `@@CLI@@`. It identifies you by session id automatically. Exit codes: **0** ok, **2** another agent holds the screen, **3** the human paused you.
+
+## Rules
+
+1. **Get the human's go-ahead first.** Then, before the first GUI action, run:
+   `@@CLI@@ acquire "<short task, e.g. Opening 10 test PSDs in Photoshop>"`
+   - Exit 2: another session holds the screen. Do not touch the UI. Tell the human who holds it (it is printed) and wait or ask.
+   - Exit 3: the human paused. Do not touch the UI.
+2. **Wrap every UI step** (activate, screenshot, AppleScript or JSX that needs the app in front, mouse, keys) in `run`:
+   `@@CLI@@ run -- osascript -e '...'`
+   `run` refuses to start while the human has paused (exit 3), heart-beats while the step runs, and marks the step busy so a pause waits for it to finish. Put "activate the app" and the actions that need it in front **in the same step**, so nothing can steal focus in between.
+3. **On exit 3 (paused): stop all UI work at once.** Tell the human in chat that you are paused and that they resume from the menu bar light. Then either end your turn or run `@@CLI@@ wait-resume` in the background. On resume, check what is in front before continuing; they may have changed things.
+4. **The human looking at the chat is not a reason to stop.** Do not conclude from a screenshot that they took over. The lease is the only signal: if `run` succeeds, the screen is yours.
+5. **When you need input:** `@@CLI@@ need-you "<one-line question>"`, then ask in chat. Once they answer, run `@@CLI@@ working` and continue.
+6. **When you are done with the screen:** `@@CLI@@ release "<one-line result>"` **immediately**, before any long write-up. Do not end a turn while still holding a `driving` lease you are not about to use. Once released, **taking it again needs a new go-ahead**: the human treats 🟢 as "my keyboard is safe".
+7. **Between UI steps** (analysing a screenshot, running tests), keep the lease alive with `@@CLI@@ heartbeat` at least every couple of minutes. It also returns exit 3 if they paused.
+
+## Don't depend on the app being in front
+
+- **Screenshot a window even when it's covered:**
+  `screencapture -x -o -l "$(@@WINDOWID@@ "<App Name>" | head -1 | cut -f1)" out.png`
+  This beats a full-screen capture, which may catch the chat window instead.
+- **Prefer AppleScript or JSX object-model commands**, which work in the background, over UI scripting.
+- **Never send a blind keystroke.** System Events `keystroke` and `key code` go to the **frontmost** app, whatever `tell process` says. That is how a dialog watcher once typed Return into the human's chat on every letter they typed. To dismiss a dialog, click a named button of that app's own window (`click button "OK" of window 1 of process "X"`), or turn dialogs off (for example Photoshop's `display dialogs to never`). If a keystroke is truly needed, check `frontmost of process "X"` in the same script immediately before sending it.
+- **Never leave a background loop running** that clicks or types. Every UI action happens inside a `run` step you are waiting on.
+
+## Other commands
+
+- `@@CLI@@ status`: shows the lease, plus `paused=yes`, `busy_pid=` and `stale=yes` when they apply.
+- `@@CLI@@ clear`: force the lease free. Only when the human asks, or to clear your own stale lease.

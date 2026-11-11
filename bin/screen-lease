@@ -1,0 +1,244 @@
+#!/bin/bash
+# screen-lease: one shared "who has the screen" lease for AI agents that drive GUI apps
+# on a computer a human is also using. Pairs with the ScreenLeaseLight menu bar app.
+#
+# Exit codes: 0 ok, 1 usage/error, 2 held by another owner, 3 paused by the human.
+# State lives in $SCREEN_LEASE_DIR (default ~/Library/Application Support/screen-lease):
+#   lease   key=value lines (state, owner, label, purpose, message, acquired, heartbeat)
+#   paused  exists while the human has asked the agent to pause (written by the menu bar app)
+#   busy    pid of a `screen-lease run` command currently executing a UI step
+
+set -u
+
+DIR="${SCREEN_LEASE_DIR:-$HOME/Library/Application Support/screen-lease}"
+CONFIG="${SCREEN_LEASE_CONFIG:-$HOME/.config/screen-lease/config.json}"
+LEASE="$DIR/lease"
+PAUSED="$DIR/paused"
+BUSY="$DIR/busy"
+LOCKDIR="$DIR/.lock"
+
+mkdir -p "$DIR"
+
+now() { date +%s; }
+
+config_num() { # key default
+	local v
+	v=$(/usr/bin/plutil -extract "$1" raw -o - "$CONFIG" 2>/dev/null) || v=""
+	case "$v" in '' | *[!0-9]*) echo "$2" ;; *) echo "$v" ;; esac
+}
+STALE=$(config_num stale_seconds 120)
+HEARTBEAT_EVERY=$(config_num heartbeat_seconds 10)
+
+default_owner() {
+	if [ -n "${SCREEN_LEASE_OWNER:-}" ]; then echo "$SCREEN_LEASE_OWNER"
+	elif [ -n "${CLAUDE_CODE_HOST_SESSION_ID:-}" ]; then echo "$CLAUDE_CODE_HOST_SESSION_ID"
+	elif [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then echo "$CLAUDE_CODE_SESSION_ID"
+	else echo "anonymous"; fi
+}
+
+clean() { printf '%s' "$1" | tr '\n\r' '  '; } # values are one line each
+
+get() { # key -> value from lease file
+	[ -f "$LEASE" ] || return 0
+	grep -m1 "^$1=" "$LEASE" 2>/dev/null | cut -d= -f2-
+}
+
+lock() {
+	local i=0
+	until mkdir "$LOCKDIR" 2>/dev/null; do
+		i=$((i + 1))
+		if [ $i -gt 50 ]; then # 5 s: assume a crashed writer left it behind
+			rmdir "$LOCKDIR" 2>/dev/null
+			i=0
+		fi
+		sleep 0.1
+	done
+	trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
+}
+unlock() { rmdir "$LOCKDIR" 2>/dev/null; trap - EXIT; }
+
+write_lease() { # state owner label purpose message acquired heartbeat
+	local tmp="$LEASE.tmp.$$"
+	{
+		echo "state=$1"
+		echo "owner=$(clean "$2")"
+		echo "label=$(clean "$3")"
+		echo "purpose=$(clean "$4")"
+		echo "message=$(clean "$5")"
+		echo "acquired=$6"
+		echo "heartbeat=$7"
+	} >"$tmp" && mv -f "$tmp" "$LEASE"
+}
+
+busy_alive() {
+	local pid
+	[ -f "$BUSY" ] || return 1
+	pid=$(cat "$BUSY" 2>/dev/null)
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+is_stale() { # driving lease whose heartbeat stopped and no live UI step
+	[ "$(get state)" = "driving" ] || return 1
+	busy_alive && return 1
+	local hb
+	hb=$(get heartbeat)
+	[ -n "$hb" ] && [ $(($(now) - hb)) -gt "$STALE" ]
+}
+
+held_by_other() { # owner -> 0 if someone else holds a live lease
+	local st cur
+	st=$(get state)
+	cur=$(get owner)
+	[ -z "$st" ] || [ "$st" = "free" ] && return 1
+	[ "$cur" = "$1" ] && return 1
+	is_stale && return 1
+	return 0
+}
+
+describe_holder() {
+	echo "screen is held by $(get label) [$(get owner)]: $(get purpose) ($(get state))" >&2
+}
+
+require_holder() { # owner
+	if [ "$(get owner)" != "$1" ] || [ "$(get state)" = "free" ] || [ -z "$(get state)" ]; then
+		if held_by_other "$1"; then describe_holder; return 2; fi
+		echo "you do not hold the screen lease; run: screen-lease acquire \"<purpose>\"" >&2
+		return 2
+	fi
+}
+
+paused_msg() { echo "PAUSED: the human has asked for the screen. Stop UI work; run 'screen-lease wait-resume' or tell them you are waiting." >&2; }
+
+usage() {
+	cat >&2 <<'EOF'
+usage: screen-lease <command> [--owner ID] [--label NAME] [args]
+
+  acquire "<purpose>"     take the screen (fails 2 if another agent holds it, 3 if paused)
+  working ["<purpose>"]   back to driving after need-you; optionally update purpose
+  heartbeat               keep the lease alive (fails 3 if the human paused)
+  check                   0 = ok to touch the UI now, 2 = not your lease, 3 = paused
+  run -- <cmd> [args]     run one UI step: checks pause, heartbeats while it runs,
+                          marks the step busy so a pause waits for it to finish
+  need-you "<message>"    ask the human for input (yellow light), keep the lease
+  release ["<message>"]   hand the screen back (green light); clears any pause
+  wait-resume [secs]      block until the human resumes (exit 3 on timeout)
+  status                  print the lease state
+  clear                   force the lease free (human use, or stale lease)
+
+owner defaults to $SCREEN_LEASE_OWNER, then $CLAUDE_CODE_HOST_SESSION_ID / $CLAUDE_CODE_SESSION_ID.
+EOF
+	exit 1
+}
+
+[ $# -ge 1 ] || usage
+CMD="$1"
+shift
+OWNER=$(default_owner)
+LABEL="${SCREEN_LEASE_LABEL:-}"
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--owner) OWNER="$2"; shift 2 ;;
+	--label) LABEL="$2"; shift 2 ;;
+	*) break ;;
+	esac
+done
+[ -n "$LABEL" ] || LABEL="${OWNER:0:14}"
+
+case "$CMD" in
+acquire)
+	[ $# -ge 1 ] || usage
+	lock
+	if held_by_other "$OWNER"; then describe_holder; unlock; exit 2; fi
+	if [ -f "$PAUSED" ]; then paused_msg; unlock; exit 3; fi
+	acq=$(now)
+	[ "$(get owner)" = "$OWNER" ] && [ "$(get state)" != "free" ] && acq=$(get acquired)
+	write_lease driving "$OWNER" "$LABEL" "$1" "" "$acq" "$(now)"
+	unlock
+	echo "screen acquired: $1"
+	;;
+working)
+	lock
+	require_holder "$OWNER" || { r=$?; unlock; exit $r; }
+	if [ -f "$PAUSED" ]; then paused_msg; unlock; exit 3; fi
+	write_lease driving "$OWNER" "$(get label)" "${1:-$(get purpose)}" "" "$(get acquired)" "$(now)"
+	unlock
+	;;
+heartbeat | check)
+	lock
+	require_holder "$OWNER" || { r=$?; unlock; exit $r; }
+	if [ "$CMD" = heartbeat ] || [ "$(get state)" = driving ]; then
+		write_lease "$(get state)" "$OWNER" "$(get label)" "$(get purpose)" "$(get message)" "$(get acquired)" "$(now)"
+	fi
+	unlock
+	if [ -f "$PAUSED" ]; then paused_msg; exit 3; fi
+	;;
+run)
+	[ "${1:-}" = "--" ] && shift
+	[ $# -ge 1 ] || usage
+	lock
+	require_holder "$OWNER" || { r=$?; unlock; exit $r; }
+	if [ -f "$PAUSED" ]; then paused_msg; unlock; exit 3; fi
+	[ "$(get state)" = driving ] || { echo "lease is in state $(get state); run 'screen-lease working' first" >&2; unlock; exit 1; }
+	write_lease driving "$OWNER" "$(get label)" "$(get purpose)" "" "$(get acquired)" "$(now)"
+	unlock
+	"$@" &
+	child=$!
+	echo "$child" >"$BUSY"
+	(
+		while kill -0 "$child" 2>/dev/null; do
+			sleep "$HEARTBEAT_EVERY"
+			kill -0 "$child" 2>/dev/null || break
+			if [ "$(get owner)" = "$OWNER" ] && [ "$(get state)" = driving ]; then
+				write_lease driving "$OWNER" "$(get label)" "$(get purpose)" "" "$(get acquired)" "$(now)"
+			fi
+		done
+	) &
+	hbpid=$!
+	wait "$child"
+	rc=$?
+	kill "$hbpid" 2>/dev/null
+	wait "$hbpid" 2>/dev/null
+	[ "$(cat "$BUSY" 2>/dev/null)" = "$child" ] && rm -f "$BUSY"
+	if [ -f "$PAUSED" ]; then paused_msg; fi
+	exit $rc
+	;;
+need-you)
+	[ $# -ge 1 ] || usage
+	lock
+	require_holder "$OWNER" || { r=$?; unlock; exit $r; }
+	write_lease need-you "$OWNER" "$(get label)" "$(get purpose)" "$1" "$(get acquired)" "$(now)"
+	unlock
+	;;
+release)
+	lock
+	if [ "$(get owner)" != "$OWNER" ] && held_by_other "$OWNER"; then describe_holder; unlock; exit 2; fi
+	write_lease free "$OWNER" "$(get label)" "$(get purpose)" "${1:-done}" "$(get acquired)" "$(now)"
+	rm -f "$PAUSED" "$BUSY"
+	unlock
+	echo "screen released"
+	;;
+wait-resume)
+	limit="${1:-0}"
+	start=$(now)
+	while [ -f "$PAUSED" ]; do
+		if [ "$limit" -gt 0 ] && [ $(($(now) - start)) -ge "$limit" ]; then exit 3; fi
+		sleep 1
+	done
+	echo "resumed"
+	;;
+status)
+	if [ ! -f "$LEASE" ]; then echo "state=free"; else cat "$LEASE"; fi
+	[ -f "$PAUSED" ] && echo "paused=yes"
+	busy_alive && echo "busy_pid=$(cat "$BUSY")"
+	is_stale && echo "stale=yes"
+	echo "me=$OWNER"
+	;;
+clear)
+	lock
+	write_lease free "$(get owner)" "$(get label)" "$(get purpose)" "cleared" "$(get acquired)" "$(now)"
+	rm -f "$PAUSED" "$BUSY"
+	unlock
+	echo "lease cleared"
+	;;
+*) usage ;;
+esac
