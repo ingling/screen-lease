@@ -5,6 +5,9 @@
 //   🟢 the screen is yours
 //   ⚪ stale: the agent holds the lease but stopped heart-beating (crashed or forgot)
 // Never takes focus (accessory app, no Dock icon). Plays a sound on every change.
+// Also shows the "ready to use the screen" dialog that `screen-lease acquire` asks for:
+// a non-activating panel that can never become key, so no keystroke can reach or dismiss it,
+// and typing in another app is not interrupted. Go ahead / Wait; auto-go when the countdown ends.
 // Build: swiftc -O -o ScreenLeaseLight ScreenLeaseLight.swift
 
 import AppKit
@@ -18,7 +21,7 @@ struct Config {
     var staleSeconds = 120.0
     var sounds: [String: String] = [
         "driving": "Tink", "pausing": "Pop", "paused": "Glass", "need-you": "Glass",
-        "free": "Hero", "stale": "Basso",
+        "free": "Hero", "stale": "Basso", "ask": "Ping", "waiting": "",
     ]
     var needYouRepeatSeconds = 0.0
     var onNeedYou: String? = nil
@@ -41,20 +44,33 @@ struct Config {
 }
 
 enum Light: String {
-    case driving, pausing, paused, needYou = "need-you", free, stale
+    case driving, pausing, paused, needYou = "need-you", waiting, free, stale
     var glyph: String {
         switch self {
         case .driving: return "🔴"
         case .pausing: return "🔴⏸"
-        case .paused, .needYou: return "🟡"
+        case .paused, .needYou, .waiting: return "🟡"
         case .free: return "🟢"
         case .stale: return "⚪"
         }
     }
 }
 
-func readLease() -> [String: String] {
-    guard let text = try? String(contentsOfFile: stateDir + "/lease", encoding: .utf8) else { return [:] }
+func readLease() -> [String: String] { readKV(stateDir + "/lease") }
+
+func writeLease(_ l: [String: String]) {
+    let order = ["state", "owner", "label", "purpose", "message", "acquired", "heartbeat"]
+    let text = order.map { "\($0)=\(l[$0] ?? "")" }.joined(separator: "\n") + "\n"
+    try? text.write(toFile: stateDir + "/lease", atomically: true, encoding: .utf8)
+}
+
+final class AskPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+func readKV(_ path: String) -> [String: String] {
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [:] }
     var d: [String: String] = [:]
     for line in text.split(separator: "\n") {
         if let eq = line.firstIndex(of: "=") {
@@ -114,11 +130,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !busy && Date().timeIntervalSince1970 - hb > config.staleSeconds { return .stale }
             return .driving
         case "need-you": return .needYou
+        case "waiting": return .waiting
+        case "approved": return .driving
         default: return paused ? .paused : .free
         }
     }
 
+    // MARK: ready-to-use-the-screen dialog
+
+    var askPanel: AskPanel?
+    var askID: String?
+    var askDeadline = Date()
+    var askCountdown: NSTextField?
+
+    func checkAsk() {
+        let ask = readKV(stateDir + "/ask")
+        if let id = ask["id"], id != askID {
+            showAsk(id: id, ask: ask)
+        } else if ask["id"] == nil, askPanel != nil {
+            closeAsk()  // the CLI gave up waiting
+        }
+        guard askPanel != nil else { return }
+        let left = Int(ceil(askDeadline.timeIntervalSinceNow))
+        if left <= 0 { answer("go") } else { askCountdown?.stringValue = "Going ahead in \(left) s unless you click Wait." }
+    }
+
+    func label(_ s: String, bold: Bool = false) -> NSTextField {
+        let t = NSTextField(wrappingLabelWithString: s)
+        t.font = bold ? .boldSystemFont(ofSize: 14) : .systemFont(ofSize: 12)
+        t.preferredMaxLayoutWidth = 380
+        return t
+    }
+
+    func button(_ title: String, _ sel: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: sel)
+        b.keyEquivalent = ""
+        b.refusesFirstResponder = true
+        b.bezelStyle = .rounded
+        return b
+    }
+
+    func showAsk(id: String, ask: [String: String]) {
+        closeAsk()
+        askID = id
+        let timeout = Double(ask["timeout"] ?? "") ?? 10
+        askDeadline = Date().addingTimeInterval(timeout)
+        let who = ask["label"] ?? "An agent"
+        let countdown = label("Going ahead in \(Int(timeout)) s unless you click Wait.")
+        askCountdown = countdown
+        let buttons = NSStackView(views: [button("Wait", #selector(askWait)), button("Go ahead", #selector(askGo))])
+        buttons.spacing = 12
+        let stack = NSStackView(views: [
+            label("\(who) is ready to use the screen", bold: true),
+            label(ask["purpose"] ?? ""), countdown, buttons,
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 16, bottom: 14, right: 16)
+        let p = AskPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 150),
+            styleMask: [.titled, .nonactivatingPanel, .utilityWindow], backing: .buffered, defer: false)
+        p.title = "Screen Lease"
+        p.contentView = stack
+        p.level = .statusBar
+        p.isFloatingPanel = true
+        p.hidesOnDeactivate = false
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        p.setContentSize(stack.fittingSize)
+        if let screen = NSScreen.screens.first {
+            let f = p.frame
+            p.setFrameOrigin(NSPoint(x: screen.frame.midX - f.width / 2, y: screen.visibleFrame.maxY - f.height - 40))
+        }
+        p.orderFrontRegardless()
+        askPanel = p
+        if let s = config.sounds["ask"], !s.isEmpty { NSSound(named: s)?.play() }
+    }
+
+    func answer(_ a: String) {
+        if let id = askID {
+            try? "id=\(id)\nanswer=\(a)\n".write(toFile: stateDir + "/ask-response", atomically: true, encoding: .utf8)
+        }
+        closeAsk()
+    }
+
+    func closeAsk() {
+        askPanel?.orderOut(nil)
+        askPanel = nil
+        askCountdown = nil
+    }
+
+    @objc func askGo() { answer("go") }
+    @objc func askWait() { answer("wait") }
+
+    @objc func letGo() {
+        var l = readLease()
+        guard l["state"] == "waiting" else { return }
+        l["state"] = "approved"
+        l["message"] = "you said go"
+        l["heartbeat"] = String(Int(Date().timeIntervalSince1970))
+        writeLease(l)
+        tick()
+    }
+
     func tick() {
+        checkAsk()
         let new = compute()
         if new != light {
             let first = (light == nil)
@@ -148,6 +264,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .pausing: return "Pause requested: \(who) is finishing its current step"
         case .paused: return "Paused: the screen is yours"
         case .needYou: return "\(who) needs you: \(lease["message"] ?? "")"
+        case .waiting: return "\(who) is waiting for your OK to use the screen"
         case .free: return "The screen is yours"
         case .stale: return "\(who) holds the screen but stopped responding"
         }
@@ -174,6 +291,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
         let paused = FileManager.default.fileExists(atPath: stateDir + "/paused")
+        if state == "waiting" {
+            add(menu, "Let \(lease["label"] ?? "agent") go ahead", #selector(letGo))
+        }
         if paused {
             add(menu, "Resume agent", #selector(resume))
         } else if state == "driving" {
@@ -212,9 +332,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         l["state"] = "free"
         l["message"] = "cleared by you"
         l["heartbeat"] = String(Int(Date().timeIntervalSince1970))
-        let order = ["state", "owner", "label", "purpose", "message", "acquired", "heartbeat"]
-        let text = order.map { "\($0)=\(l[$0] ?? "")" }.joined(separator: "\n") + "\n"
-        try? text.write(toFile: stateDir + "/lease", atomically: true, encoding: .utf8)
+        writeLease(l)
         try? FileManager.default.removeItem(atPath: stateDir + "/paused")
         try? FileManager.default.removeItem(atPath: stateDir + "/busy")
         tick()

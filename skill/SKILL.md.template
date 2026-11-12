@@ -11,18 +11,20 @@ The human uses this same computer. A menu bar light (ScreenLeaseLight) shows the
 |---|---|---|
 | 🔴 | an agent is driving: hands off | `acquire`, `working` |
 | 🔴⏸ | they asked for a pause; you are finishing the current step | their menu click, while a `run` step is executing |
-| 🟡 | you need them, or you paused and the screen is theirs | `need-you`, or a pause once no step is running |
+| 🟡 | you need them, you're waiting for their OK, or you paused and the screen is theirs | `need-you`, Wait on the dialog, or a pause once no step is running |
 | 🟢 | the screen is theirs | `release` |
 | ⚪ | stale: you hold the lease but stopped heart-beating | no heartbeat for `stale_seconds` |
 
 Every change plays a sound, so the human can leave the app you're driving in front and still know when you're done or stuck.
 
-CLI: `@@CLI@@`. It identifies you by session id automatically. Exit codes: **0** ok, **2** another agent holds the screen, **3** the human paused you.
+CLI: `@@CLI@@`. It identifies you by session id automatically. Exit codes: **0** ok, **2** another agent holds the screen, **3** the human paused you, **4** the human clicked Wait on the ready-to-start dialog.
 
 ## Rules
 
-1. **Get the human's go-ahead first.** Then, before the first GUI action, run:
-   `@@CLI@@ acquire "<short task, e.g. Opening 10 test PSDs in Photoshop>"`
+1. **Get the human's go-ahead in chat first.** Then do all the preparation that doesn't touch the UI (building test files, reading code, planning). **Only when the very next command is a UI action**, run:
+   `@@CLI@@ acquire --label "<your session's short name>" "<short task, e.g. Opening 10 test PSDs in Photoshop>"`
+   - Unless you used the screen in the last couple of minutes, this pops up a **"ready to use the screen" dialog** for the human and blocks for up to ~10 s. They can click Go ahead or Wait. If they don't answer, it goes ahead (exit 0).
+   - Exit 4: **they clicked Wait.** Do not touch the UI. Say in chat that you're waiting for their OK. Then run `@@CLI@@ wait-resume` in the background; it returns when they choose "Let … go ahead" from the menu bar light. After that, `acquire` again (no dialog this time). If they say go in chat instead, use `acquire --now`.
    - Exit 2: another session holds the screen. Do not touch the UI. Tell the human who holds it (it is printed) and wait or ask.
    - Exit 3: the human paused. Do not touch the UI.
 2. **Wrap every UI step** (activate, screenshot, AppleScript or JSX that needs the app in front, mouse, keys) in `run`:
@@ -31,8 +33,11 @@ CLI: `@@CLI@@`. It identifies you by session id automatically. Exit codes: **0**
 3. **On exit 3 (paused): stop all UI work at once.** Tell the human in chat that you are paused and that they resume from the menu bar light. Then either end your turn or run `@@CLI@@ wait-resume` in the background. On resume, check what is in front before continuing; they may have changed things.
 4. **The human looking at the chat is not a reason to stop.** Do not conclude from a screenshot that they took over. The lease is the only signal: if `run` succeeds, the screen is yours.
 5. **When you need input:** `@@CLI@@ need-you "<one-line question>"`, then ask in chat. Once they answer, run `@@CLI@@ working` and continue.
-6. **When you are done with the screen:** `@@CLI@@ release "<one-line result>"` **immediately**, before any long write-up. Do not end a turn while still holding a `driving` lease you are not about to use. Once released, **taking it again needs a new go-ahead**: the human treats 🟢 as "my keyboard is safe".
-7. **Between UI steps** (analysing a screenshot, running tests), keep the lease alive with `@@CLI@@ heartbeat` at least every couple of minutes. It also returns exit 3 if they paused.
+6. **When you are done with the screen:** `@@CLI@@ release "<one-line result>"` **immediately**, before any long write-up. Do not end a turn while still holding a `driving` lease you are not about to use.
+7. **Gaps between UI bursts:**
+   - Short gap (under a minute or so): keep the lease and run `@@CLI@@ heartbeat` (it also returns exit 3 if they paused).
+   - Longer gap (building files, running tests, long analysis): `release` so the human gets their screen back. `acquire` again when ready. Within the same approved task you don't need to ask again in chat; the dialog handles it (and it is skipped if you're back within a couple of minutes).
+   - A **new task** needs a new go-ahead in chat.
 
 ## Don't depend on the app being in front
 

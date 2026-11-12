@@ -2,11 +2,15 @@
 # screen-lease: one shared "who has the screen" lease for AI agents that drive GUI apps
 # on a computer a human is also using. Pairs with the ScreenLeaseLight menu bar app.
 #
-# Exit codes: 0 ok, 1 usage/error, 2 held by another owner, 3 paused by the human.
+# Exit codes: 0 ok, 1 usage/error, 2 held by another owner, 3 paused by the human,
+#             4 the human clicked "Wait" on the ready-to-start dialog.
 # State lives in $SCREEN_LEASE_DIR (default ~/Library/Application Support/screen-lease):
-#   lease   key=value lines (state, owner, label, purpose, message, acquired, heartbeat)
-#   paused  exists while the human has asked the agent to pause (written by the menu bar app)
-#   busy    pid of a `screen-lease run` command currently executing a UI step
+#   lease         key=value lines (state, owner, label, purpose, message, acquired, heartbeat)
+#                 state: free | driving | need-you | waiting (human said wait) | approved (human said go)
+#   paused        exists while the human has asked the agent to pause (written by the menu bar app)
+#   busy          pid of a `screen-lease run` command currently executing a UI step
+#   ask           a pending "ready to use the screen" question for the menu bar app to show
+#   ask-response  the app's answer (id=..., answer=go|wait)
 
 set -u
 
@@ -28,6 +32,10 @@ config_num() { # key default
 }
 STALE=$(config_num stale_seconds 120)
 HEARTBEAT_EVERY=$(config_num heartbeat_seconds 10)
+ASK_SECONDS=$(config_num ask_seconds 10)        # dialog countdown; 0 = never ask
+RECONFIRM=$(config_num reconfirm_after_seconds 120) # same owner back within this: no dialog
+ASK="$DIR/ask"
+ASK_RESPONSE="$DIR/ask-response"
 
 default_owner() {
 	if [ -n "${SCREEN_LEASE_OWNER:-}" ]; then echo "$SCREEN_LEASE_OWNER"
@@ -89,10 +97,55 @@ held_by_other() { # owner -> 0 if someone else holds a live lease
 	local st cur
 	st=$(get state)
 	cur=$(get owner)
-	[ -z "$st" ] || [ "$st" = "free" ] && return 1
+	[ -z "$st" ] || [ "$st" = "free" ] || [ "$st" = "waiting" ] && return 1
 	[ "$cur" = "$1" ] && return 1
 	is_stale && return 1
+	if [ "$st" = "approved" ]; then # human said go to someone else; they get a short head start
+		local hb
+		hb=$(get heartbeat)
+		[ -n "$hb" ] && [ $(($(now) - hb)) -gt "$RECONFIRM" ] && return 1
+	fi
 	return 0
+}
+
+needs_ask() { # owner -> 0 if the human should confirm before this owner takes the screen
+	[ "$ASK_SECONDS" -gt 0 ] || return 1
+	[ "$(get owner)" = "$1" ] || return 0
+	case "$(get state)" in
+	driving | need-you | approved) return 1 ;;
+	free)
+		local hb
+		hb=$(get heartbeat)
+		[ -n "$hb" ] && [ $(($(now) - hb)) -le "$RECONFIRM" ] && return 1
+		;;
+	esac
+	return 0
+}
+
+ask_human() { # owner label purpose -> prints go|wait. The menu bar app shows the dialog.
+	local id="$$-$(now)" deadline answer=go
+	if [ -z "${SCREEN_LEASE_ASSUME_UI:-}" ] && ! pgrep -xq ScreenLeaseLight; then
+		echo "warning: ScreenLeaseLight is not running; cannot ask, going ahead" >&2
+		echo go
+		return
+	fi
+	{
+		echo "id=$id"
+		echo "owner=$(clean "$1")"
+		echo "label=$(clean "$2")"
+		echo "purpose=$(clean "$3")"
+		echo "timeout=$ASK_SECONDS"
+	} >"$ASK.tmp.$$" && mv -f "$ASK.tmp.$$" "$ASK"
+	deadline=$(($(now) + ASK_SECONDS + 5))
+	while [ "$(now)" -le "$deadline" ]; do
+		if [ -f "$ASK_RESPONSE" ] && grep -qx "id=$id" "$ASK_RESPONSE"; then
+			answer=$(grep -m1 '^answer=' "$ASK_RESPONSE" | cut -d= -f2-)
+			break
+		fi
+		sleep 0.3
+	done
+	[ "$(grep -m1 '^id=' "$ASK" 2>/dev/null | cut -d= -f2-)" = "$id" ] && rm -f "$ASK"
+	[ "$answer" = wait ] && echo wait || echo go
 }
 
 describe_holder() {
@@ -113,7 +166,12 @@ usage() {
 	cat >&2 <<'EOF'
 usage: screen-lease <command> [--owner ID] [--label NAME] [args]
 
-  acquire "<purpose>"     take the screen (fails 2 if another agent holds it, 3 if paused)
+  acquire "<purpose>"     take the screen. Unless this owner used it within
+                          reconfirm_after_seconds, the light first shows a "ready to use
+                          the screen" dialog: Go ahead / Wait, auto-go after ask_seconds.
+                          Fails 2 if another agent holds it, 3 if paused, 4 if the human
+                          clicked Wait (then: wait-resume, and acquire again).
+    --now                 skip the dialog (only when the human just said go in chat)
   working ["<purpose>"]   back to driving after need-you; optionally update purpose
   heartbeat               keep the lease alive (fails 3 if the human paused)
   check                   0 = ok to touch the UI now, 2 = not your lease, 3 = paused
@@ -121,7 +179,8 @@ usage: screen-lease <command> [--owner ID] [--label NAME] [args]
                           marks the step busy so a pause waits for it to finish
   need-you "<message>"    ask the human for input (yellow light), keep the lease
   release ["<message>"]   hand the screen back (green light); clears any pause
-  wait-resume [secs]      block until the human resumes (exit 3 on timeout)
+  wait-resume [secs]      block until the human resumes a pause or lets a waiting agent go
+                          (exit 3 on timeout)
   status                  print the lease state
   clear                   force the lease free (human use, or stale lease)
 
@@ -135,10 +194,12 @@ CMD="$1"
 shift
 OWNER=$(default_owner)
 LABEL="${SCREEN_LEASE_LABEL:-}"
+NOW=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--owner) OWNER="$2"; shift 2 ;;
 	--label) LABEL="$2"; shift 2 ;;
+	--now) NOW=1; shift ;;
 	*) break ;;
 	esac
 done
@@ -147,6 +208,21 @@ done
 case "$CMD" in
 acquire)
 	[ $# -ge 1 ] || usage
+	lock
+	if held_by_other "$OWNER"; then describe_holder; unlock; exit 2; fi
+	if [ -f "$PAUSED" ]; then paused_msg; unlock; exit 3; fi
+	ask=""
+	[ -z "$NOW" ] && needs_ask "$OWNER" && ask=1
+	unlock
+	if [ -n "$ask" ] && [ "$(ask_human "$OWNER" "$LABEL" "$1")" = wait ]; then
+		lock
+		if ! held_by_other "$OWNER"; then
+			write_lease waiting "$OWNER" "$LABEL" "$1" "waiting for your OK" "$(now)" "$(now)"
+		fi
+		unlock
+		echo "WAIT: the human clicked Wait. Do not touch the UI. Tell them you are waiting; run 'screen-lease wait-resume' (they let you go from the menu bar light, or say go in chat: then 'acquire --now')." >&2
+		exit 4
+	fi
 	lock
 	if held_by_other "$OWNER"; then describe_holder; unlock; exit 2; fi
 	if [ -f "$PAUSED" ]; then paused_msg; unlock; exit 3; fi
@@ -220,7 +296,7 @@ release)
 wait-resume)
 	limit="${1:-0}"
 	start=$(now)
-	while [ -f "$PAUSED" ]; do
+	while [ -f "$PAUSED" ] || { [ "$(get state)" = waiting ] && [ "$(get owner)" = "$OWNER" ]; }; do
 		if [ "$limit" -gt 0 ] && [ $(($(now) - start)) -ge "$limit" ]; then exit 3; fi
 		sleep 1
 	done

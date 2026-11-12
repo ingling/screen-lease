@@ -2,13 +2,17 @@
   "stale_seconds": 120,
   "heartbeat_seconds": 10,
   "need_you_repeat_seconds": 0,
+  "ask_seconds": 10,
+  "reconfirm_after_seconds": 120,
   "sounds": {
     "driving": "Tink",
     "pausing": "Pop",
     "paused": "Glass",
     "need-you": "Glass",
     "free": "Hero",
-    "stale": "Basso"
+    "stale": "Basso",
+    "ask": "Ping",
+    "waiting": ""
   },
   "on_need_you": null,
   "on_free": null,
