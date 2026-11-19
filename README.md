@@ -38,6 +38,31 @@ SKILL_DIR= ./install.sh           # skip the Claude Code skill
 
 You need the Xcode command line tools (`swiftc`). The light starts at login via a LaunchAgent. Choosing Quit from its menu stops it until you next log in or run `install.sh`.
 
+### Claude Code: turn the light yellow on permission prompts
+
+If the agent holding the screen stops on a Claude Code permission prompt, it is waiting on you, but the light still says 🔴 hands off. Claude Code hooks fix that:
+
+```bash
+./install.sh --claude-hooks           # adds the hooks to ~/.claude/settings.json (backup next to it)
+./install.sh --remove-claude-hooks    # takes them out; other hooks are left alone
+```
+
+(Pass the same `BIN_DIR` you installed with, and `CLAUDE_SETTINGS=<path>` for another settings file.)
+
+| Hook event | Runs | Effect |
+|---|---|---|
+| `PermissionRequest` | `screen-lease hook prompt` | the holder is waiting on a prompt: 🔴 → 🟡 "Approve a permission prompt in Claude" |
+| `PostToolUse`, `PostToolUseFailure` | `screen-lease hook answered` | the prompted tool ran: 🟡 → 🔴 |
+| `Stop`, `UserPromptSubmit` | `screen-lease hook answered` | fallback for a denied prompt (Claude Code has no event for a manual deny) |
+
+- The hooks act only for the session that holds the lease (matched by Claude Code's session id from the environment or the hook's JSON input), and only from 🔴 driving. Every other session's prompts and tool calls leave the light alone.
+- `answered` only undoes a 🟡 that `prompt` set, and only when the same tool finishes, so an agent's own `need-you` question stays up and a parallel tool call doesn't clear the prompt.
+- The agent's next `run`, `heartbeat` or `check` also counts as an answer, so a prompted `screen-lease run` step goes straight back to 🔴.
+- The hooks run `async`, so they never delay Claude. When nobody holds the screen they exit after one file read.
+- While 🟡 the lease does not go stale, so another agent can't take the screen while you decide.
+
+To wire them by hand, add the five events above to `hooks` in your settings, each with `{"type": "command", "command": "/path/to/screen-lease hook prompt|answered", "async": true}` (matcher `"*"` on the tool events).
+
 ## Configure
 
 Settings live in `~/.config/screen-lease/config.json`, created from [`config.example.json`](config.example.json):
@@ -68,6 +93,8 @@ screen-lease working ["<purpose>"]   back to 🔴
 screen-lease release ["<result>"]    🟢
 screen-lease wait-resume [secs]      block until you resume, or let a waiting agent go
 screen-lease status | clear
+screen-lease hook prompt | answered  for Claude Code hooks: silent, always exit 0, no-op unless
+                                     this session holds the screen
 ```
 
 State lives in `~/Library/Application Support/screen-lease/` (override with `$SCREEN_LEASE_DIR`).

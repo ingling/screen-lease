@@ -53,6 +53,65 @@ expect 0 "anyone acquires after release" "$S" acquire --owner A "again"
 expect 0 "clear" "$S" clear
 expect 2 "heartbeat without lease fails" "$S" heartbeat --owner A
 
+# --- Claude Code permission-prompt hooks ---
+L="$SCREEN_LEASE_DIR/lease"
+st() { grep -m1 '^state=' "$L" | cut -d= -f2-; }
+is() { # want-state description
+	if [ "$(st)" = "$1" ]; then echo "ok   $2"; else echo "FAIL $2 (state=$(st), want $1)"; fails=$((fails + 1)); fi
+}
+expect 0 "hook on a free lease: no-op" "$S" hook --owner A prompt
+is free "free lease stays free"
+"$S" acquire --owner A "hooks" >/dev/null
+expect 0 "other session's prompt: exit 0" "$S" hook --owner B prompt </dev/null
+is driving "other session's prompt leaves the light red"
+expect 0 "holder's prompt" "$S" hook --owner A prompt </dev/null
+is need-you "holder's prompt turns the light yellow"
+grep -q '^message=Approve a permission prompt in Claude$' "$L" && echo "ok   default prompt message" || { echo "FAIL prompt message"; fails=$((fails + 1)); }
+expect 2 "B still blocked while A waits on a prompt" "$S" acquire --owner B "x"
+expect 0 "other session's answer: exit 0" "$S" hook --owner B answered </dev/null
+is need-you "other session's answer changes nothing"
+expect 0 "holder's answer" "$S" hook --owner A answered </dev/null
+is driving "holder's answer turns the light red again"
+expect 0 "answer with no prompt pending: no-op" "$S" hook --owner A answered </dev/null
+is driving "still driving"
+"$S" need-you --owner A "pick a file" >/dev/null
+expect 0 "prompt during the agent's own need-you" "$S" hook --owner A prompt </dev/null
+expect 0 "answer during the agent's own need-you" "$S" hook --owner A answered </dev/null
+is need-you "agent's own need-you is left alone"
+grep -q '^message=pick a file$' "$L" && echo "ok   agent's message kept" || { echo "FAIL agent's message replaced"; fails=$((fails + 1)); }
+"$S" working --owner A >/dev/null
+"$S" hook --owner A prompt </dev/null
+expect 0 "run after the prompt was approved" "$S" run --owner A -- true
+is driving "run clears a hook's need-you (approved prompt was a UI step)"
+[ -f "$SCREEN_LEASE_DIR/prompt" ] && { echo "FAIL prompt marker left behind"; fails=$((fails + 1)); } || echo "ok   prompt marker cleared"
+"$S" hook --owner A prompt </dev/null
+expect 0 "heartbeat after the prompt" "$S" heartbeat --owner A
+is driving "heartbeat clears a hook's need-you"
+expect 0 "owner from the hook's stdin session_id" sh -c "printf '%s' '{\"session_id\": \"A\", \"hook_event_name\": \"PermissionRequest\"}' | env -u CLAUDE_CODE_HOST_SESSION_ID -u CLAUDE_CODE_SESSION_ID SCREEN_LEASE_OWNER=other '$S' hook prompt"
+is need-you "stdin session_id matches the holder"
+expect 0 "answered via stdin session_id" sh -c "printf '%s' '{\"session_id\":\"A\"}' | SCREEN_LEASE_OWNER=other '$S' hook answered"
+is driving "back to driving"
+j() { printf '{"session_id":"A","hook_event_name":"%s","tool_name":"%s","tool_input":{"command":"echo \\"session_id\\": \\"B\\""}}' "$1" "$2"; }
+j PermissionRequest Bash | "$S" hook --owner other prompt
+is need-you "prompt for Bash (owner from JSON with a decoy in tool_input)"
+j PostToolUse Read | "$S" hook --owner other answered
+is need-you "a different tool finishing does not answer the Bash prompt"
+j Stop "" | "$S" hook --owner other answered
+is driving "Stop (no tool_name) answers it"
+j PermissionRequest Bash | "$S" hook --owner other prompt
+j PostToolUse Bash | "$S" hook --owner other answered
+is driving "the same tool finishing answers it"
+j PermissionRequest Bash | "$S" hook --owner other prompt
+is need-you "prompt again"
+j PostToolUse Bash | SCREEN_LEASE_DIR=/nonexistent/x "$S" hook answered 2>/dev/null; echo "ok   unwritable state dir does not hang (rc=$?)"
+"$S" working --owner A >/dev/null
+expect 0 "env owner wins without stdin" sh -c "SCREEN_LEASE_OWNER=A '$S' hook prompt </dev/null"
+is need-you "env owner matches the holder"
+expect 0 "release during a prompt" "$S" release --owner A "done"
+expect 0 "answer after release: no-op" "$S" hook --owner A answered </dev/null
+is free "release wins over a late answer"
+expect 0 "clear" "$S" clear
+
 # --- ready-to-use-the-screen dialog (a fake responder stands in for the menu bar app) ---
 export SCREEN_LEASE_CONFIG="$CFG_DIR/ask.json" SCREEN_LEASE_ASSUME_UI=1
 D="$SCREEN_LEASE_DIR"

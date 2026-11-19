@@ -19,7 +19,10 @@ CONFIG="${SCREEN_LEASE_CONFIG:-$HOME/.config/screen-lease/config.json}"
 LEASE="$DIR/lease"
 PAUSED="$DIR/paused"
 BUSY="$DIR/busy"
+PROMPT="$DIR/prompt" # owner id + tool name, while a hook has the light on need-you for a permission prompt
 LOCKDIR="$DIR/.lock"
+ASK="$DIR/ask"
+ASK_RESPONSE="$DIR/ask-response"
 
 mkdir -p "$DIR"
 
@@ -30,12 +33,6 @@ config_num() { # key default
 	v=$(/usr/bin/plutil -extract "$1" raw -o - "$CONFIG" 2>/dev/null) || v=""
 	case "$v" in '' | *[!0-9]*) echo "$2" ;; *) echo "$v" ;; esac
 }
-STALE=$(config_num stale_seconds 120)
-HEARTBEAT_EVERY=$(config_num heartbeat_seconds 10)
-ASK_SECONDS=$(config_num ask_seconds 10)        # dialog countdown; 0 = never ask
-RECONFIRM=$(config_num reconfirm_after_seconds 120) # same owner back within this: no dialog
-ASK="$DIR/ask"
-ASK_RESPONSE="$DIR/ask-response"
 
 default_owner() {
 	if [ -n "${SCREEN_LEASE_OWNER:-}" ]; then echo "$SCREEN_LEASE_OWNER"
@@ -160,6 +157,20 @@ require_holder() { # owner
 	fi
 }
 
+prompt_cleared() { # owner command under lock: the agent is active again, so any prompt was answered
+	[ -f "$PROMPT" ] || return 0
+	if [ "$(head -1 "$PROMPT" 2>/dev/null)" = "$OWNER" ] && [ "$(get owner)" = "$OWNER" ] && [ "$(get state)" = need-you ]; then
+		write_lease driving "$OWNER" "$(get label)" "$(get purpose)" "" "$(get acquired)" "$(now)"
+	fi
+	rm -f "$PROMPT"
+}
+
+HOOK_IN=""
+hook_field() { # top-level string field of the hook's JSON input
+	[ -n "$HOOK_IN" ] || return 0
+	printf '%s' "$HOOK_IN" | /usr/bin/plutil -extract "$1" raw -o - - 2>/dev/null
+}
+
 paused_msg() { echo "PAUSED: the human has asked for the screen. Stop UI work; run 'screen-lease wait-resume' or tell them you are waiting." >&2; }
 
 usage() {
@@ -184,6 +195,13 @@ usage: screen-lease <command> [--owner ID] [--label NAME] [args]
   status                  print the lease state
   clear                   force the lease free (human use, or stale lease)
 
+For Claude Code hooks (always exit 0, silent, and a no-op unless this session holds the lease):
+  hook prompt ["<msg>"]   a permission prompt is waiting: driving -> need-you (yellow)
+  hook answered           the prompt was answered: back to driving (red), only if
+                          `hook prompt` set the need-you, and (when the JSON has a tool_name)
+                          only for the same tool
+  Owner: --owner, the env as below, or the "session_id" in the hook's JSON on stdin.
+
 owner defaults to $SCREEN_LEASE_OWNER, then $CLAUDE_CODE_HOST_SESSION_ID / $CLAUDE_CODE_SESSION_ID.
 EOF
 	exit 1
@@ -193,6 +211,43 @@ EOF
 CMD="$1"
 shift
 OWNER=$(default_owner)
+
+# Hooks fire on every prompt / tool call in every session: cheap checks first, never fail.
+if [ "$CMD" = hook ]; then
+	[ "${1:-}" = --owner ] && { OWNER="${2:-}"; shift 2; }
+	ev="${1:-}"
+	case "$(get state)" in driving | need-you) ;; *) [ -f "$PROMPT" ] && rm -f "$PROMPT"; exit 0 ;; esac
+	[ "$ev" = answered ] && [ ! -f "$PROMPT" ] && exit 0
+	[ -t 0 ] || HOOK_IN=$(cat)
+	if [ "$(get owner)" != "$OWNER" ]; then # not the env owner: try the session_id Claude Code passes
+		sid=$(hook_field session_id)
+		[ -n "$sid" ] && [ "$(get owner)" = "$sid" ] || exit 0
+		OWNER="$sid"
+	fi
+	tool=$(hook_field tool_name)
+	lock
+	if [ "$(get owner)" = "$OWNER" ]; then
+		case "$ev" in
+		prompt)
+			if [ "$(get state)" = driving ]; then
+				write_lease need-you "$OWNER" "$(get label)" "$(get purpose)" "${2:-Approve a permission prompt in Claude}" "$(get acquired)" "$(now)"
+				printf '%s\n%s\n' "$OWNER" "$tool" >"$PROMPT"
+			fi
+			;;
+		answered) # a different tool finishing (parallel calls) does not answer this prompt
+			want=$(sed -n 2p "$PROMPT" 2>/dev/null)
+			[ -n "$tool" ] && [ -n "$want" ] && [ "$tool" != "$want" ] || prompt_cleared
+			;;
+		esac
+	fi
+	unlock
+	exit 0
+fi
+
+STALE=$(config_num stale_seconds 120)
+HEARTBEAT_EVERY=$(config_num heartbeat_seconds 10)
+ASK_SECONDS=$(config_num ask_seconds 10)        # dialog countdown; 0 = never ask
+RECONFIRM=$(config_num reconfirm_after_seconds 120) # same owner back within this: no dialog
 LABEL="${SCREEN_LEASE_LABEL:-}"
 NOW=""
 while [ $# -gt 0 ]; do
@@ -229,6 +284,7 @@ acquire)
 	acq=$(now)
 	[ "$(get owner)" = "$OWNER" ] && [ "$(get state)" != "free" ] && acq=$(get acquired)
 	write_lease driving "$OWNER" "$LABEL" "$1" "" "$acq" "$(now)"
+	rm -f "$PROMPT"
 	unlock
 	echo "screen acquired: $1"
 	;;
@@ -237,11 +293,13 @@ working)
 	require_holder "$OWNER" || { r=$?; unlock; exit $r; }
 	if [ -f "$PAUSED" ]; then paused_msg; unlock; exit 3; fi
 	write_lease driving "$OWNER" "$(get label)" "${1:-$(get purpose)}" "" "$(get acquired)" "$(now)"
+	rm -f "$PROMPT"
 	unlock
 	;;
 heartbeat | check)
 	lock
 	require_holder "$OWNER" || { r=$?; unlock; exit $r; }
+	prompt_cleared
 	if [ "$CMD" = heartbeat ] || [ "$(get state)" = driving ]; then
 		write_lease "$(get state)" "$OWNER" "$(get label)" "$(get purpose)" "$(get message)" "$(get acquired)" "$(now)"
 	fi
@@ -254,6 +312,7 @@ run)
 	lock
 	require_holder "$OWNER" || { r=$?; unlock; exit $r; }
 	if [ -f "$PAUSED" ]; then paused_msg; unlock; exit 3; fi
+	prompt_cleared
 	[ "$(get state)" = driving ] || { echo "lease is in state $(get state); run 'screen-lease working' first" >&2; unlock; exit 1; }
 	write_lease driving "$OWNER" "$(get label)" "$(get purpose)" "" "$(get acquired)" "$(now)"
 	unlock
@@ -283,13 +342,14 @@ need-you)
 	lock
 	require_holder "$OWNER" || { r=$?; unlock; exit $r; }
 	write_lease need-you "$OWNER" "$(get label)" "$(get purpose)" "$1" "$(get acquired)" "$(now)"
+	rm -f "$PROMPT"
 	unlock
 	;;
 release)
 	lock
 	if [ "$(get owner)" != "$OWNER" ] && held_by_other "$OWNER"; then describe_holder; unlock; exit 2; fi
 	write_lease free "$OWNER" "$(get label)" "$(get purpose)" "${1:-done}" "$(get acquired)" "$(now)"
-	rm -f "$PAUSED" "$BUSY"
+	rm -f "$PAUSED" "$BUSY" "$PROMPT"
 	unlock
 	echo "screen released"
 	;;
@@ -312,7 +372,7 @@ status)
 clear)
 	lock
 	write_lease free "$(get owner)" "$(get label)" "$(get purpose)" "cleared" "$(get acquired)" "$(now)"
-	rm -f "$PAUSED" "$BUSY"
+	rm -f "$PAUSED" "$BUSY" "$PROMPT"
 	unlock
 	echo "lease cleared"
 	;;

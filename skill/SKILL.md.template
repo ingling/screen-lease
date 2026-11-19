@@ -33,6 +33,7 @@ CLI: `@@CLI@@`. It identifies you by session id automatically. Exit codes: **0**
 3. **On exit 3 (paused): stop all UI work at once.** Tell the human in chat that you are paused and that they resume from the menu bar light. Then either end your turn or run `@@CLI@@ wait-resume` in the background. On resume, check what is in front before continuing; they may have changed things.
 4. **The human looking at the chat is not a reason to stop.** Do not conclude from a screenshot that they took over. The lease is the only signal: if `run` succeeds, the screen is yours.
 5. **When you need input:** `@@CLI@@ need-you "<one-line question>"`, then ask in chat. Once they answer, run `@@CLI@@ working` and continue.
+   - **Permission prompts:** if the screen-lease hooks are installed (`screen-lease hook` entries in `~/.claude/settings.json`), a Claude Code permission prompt turns the light 🟡 by itself while you hold the lease, and back to 🔴 once it is answered. Without the hooks, a prompt leaves the light 🔴 while you wait on the human. Either way, prefer to run anything that might prompt (new scripts or binaries, `kill`, network) once before `acquire`, so it is approved before you take the screen.
 6. **When you are done with the screen:** `@@CLI@@ release "<one-line result>"` **immediately**, before any long write-up. Do not end a turn while still holding a `driving` lease you are not about to use.
 7. **Gaps between UI bursts:**
    - Short gap (under a minute or so): keep the lease and run `@@CLI@@ heartbeat` (it also returns exit 3 if they paused).

@@ -3,11 +3,59 @@
 #   BIN_DIR    where the CLI and binaries go (default ~/.local/bin)
 #   SKILL_DIR  Claude Code skills dir (default ~/.claude/skills); set to "" to skip
 # Re-run any time to rebuild and reinstall. Uninstall: ./install.sh --uninstall
+#
+# Claude Code permission-prompt hooks (light turns yellow while the lease holder waits on a prompt):
+#   ./install.sh --claude-hooks           add them to ~/.claude/settings.json (backup kept next to it)
+#   ./install.sh --remove-claude-hooks    take them out again
+#   CLAUDE_SETTINGS=<path>                another settings file
 set -eu
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 SKILL_DIR="${SKILL_DIR-$HOME/.claude/skills}"
+CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+
+claude_hooks() { # add|remove: edit only screen-lease's own entries, keep everything else
+	[ -f "$CLAUDE_SETTINGS" ] && cp -p "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak-screen-lease"
+	/usr/bin/python3 - "$1" "$CLAUDE_SETTINGS" "$BIN_DIR/screen-lease" <<'PY'
+import json, os, re, sys
+mode, path, cli = sys.argv[1:]
+data = json.load(open(path)) if os.path.exists(path) and os.path.getsize(path) else {}
+hooks = data.setdefault("hooks", {})
+events = {"PermissionRequest": "prompt", "PostToolUse": "answered", "PostToolUseFailure": "answered",
+          "Stop": "answered", "UserPromptSubmit": "answered"}
+for event in list(hooks):  # drop earlier screen-lease entries
+    groups = []
+    for g in hooks[event]:
+        g["hooks"] = [h for h in g.get("hooks", [])
+                      if not re.search(r"screen-lease'? hook (prompt|answered)", h.get("command", ""))]
+        if g["hooks"]:
+            groups.append(g)
+    if groups:
+        hooks[event] = groups
+    else:
+        del hooks[event]
+if mode == "add":
+    for event, arg in events.items():
+        group = {"hooks": [{"type": "command", "command": f"'{cli}' hook {arg}", "async": True, "timeout": 10}]}
+        if event not in ("Stop", "UserPromptSubmit"):
+            group["matcher"] = "*"
+        hooks.setdefault(event, []).append(group)
+if not hooks:
+    del data["hooks"]
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+PY
+	[ "$1" = add ] && echo "screen-lease hooks added to $CLAUDE_SETTINGS" || echo "screen-lease hooks removed from $CLAUDE_SETTINGS"
+	[ -f "$CLAUDE_SETTINGS.bak-screen-lease" ] && echo "previous version: $CLAUDE_SETTINGS.bak-screen-lease"
+}
+case "${1:-}" in
+--claude-hooks) claude_hooks add; exit 0 ;;
+--remove-claude-hooks) claude_hooks remove; exit 0 ;;
+esac
 CONFIG_DIR="$HOME/.config/screen-lease"
 LABEL="io.github.screen-lease.light"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
